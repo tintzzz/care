@@ -484,6 +484,38 @@ class DiagnosticReportAPITestCases(CareAPITestBase):
             response.data,
         )
 
+    # SSMM issue 48: a final report closes its investigation order automatically
+
+    def test_final_report_completes_service_request(self):
+        """A final diagnostic report marks the active service request as completed, so the
+        order no longer shows as an open/overdue investigation request (SSMM issue 48)."""
+        self.client.force_authenticate(user=self.superuser)
+        self.assertEqual(
+            self.service_request.status, ServiceRequestStatusChoices.active.value
+        )
+        data = self.generate_diagnostic_report_data(
+            status=DiagnosticReportStatusChoices.final.value
+        )
+        response = self.client.post(self.url, data=data, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.service_request.refresh_from_db()
+        self.assertEqual(
+            self.service_request.status, ServiceRequestStatusChoices.completed.value
+        )
+
+    def test_preliminary_report_leaves_service_request_active(self):
+        """A preliminary (not final) report leaves the order open (SSMM issue 48)."""
+        self.client.force_authenticate(user=self.superuser)
+        data = self.generate_diagnostic_report_data(
+            status=DiagnosticReportStatusChoices.preliminary.value
+        )
+        response = self.client.post(self.url, data=data, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.service_request.refresh_from_db()
+        self.assertEqual(
+            self.service_request.status, ServiceRequestStatusChoices.active.value
+        )
+
 
 class DiagnosticReportUpsertObservationAPITestCases(CareAPITestBase):
     def setUp(self):
