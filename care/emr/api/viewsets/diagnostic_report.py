@@ -27,6 +27,7 @@ from care.emr.resources.diagnostic_report.spec import (
     DiagnosticReportUpdateSpec,
 )
 from care.emr.resources.observation.spec import ObservationUpdateSpec
+from care.emr.resources.service_request.spec import ServiceRequestStatusChoices
 from care.emr.resources.observation_definition.observation import (
     convert_od_to_observation,
 )
@@ -80,7 +81,28 @@ class DiagnosticReportViewSet(
         instance.facility = instance.encounter.facility
         if instance.service_request.patient != instance.patient:
             raise ValidationError("Invalid Request")
-        return super().perform_create(instance)
+        result = super().perform_create(instance)
+        self._ssmm_complete_service_request_if_final(instance)
+        return result
+
+    def perform_update(self, instance):
+        result = super().perform_update(instance)
+        self._ssmm_complete_service_request_if_final(instance)
+        return result
+
+    def _ssmm_complete_service_request_if_final(self, instance):
+        """Issue 48: once a final report is filed against an investigation order, the order should
+        no longer sit in the 'open requests' list. Close the active service request so it is not
+        chased again (a preliminary/partial report leaves the order open)."""
+        service_request = instance.service_request
+        if (
+            instance.status == DiagnosticReportStatusChoices.final.value
+            and service_request
+            and service_request.status == ServiceRequestStatusChoices.active.value
+        ):
+            service_request.status = ServiceRequestStatusChoices.completed.value
+            service_request.updated_by = self.request.user
+            service_request.save(update_fields=["status", "updated_by", "modified_date"])
 
     def authorize_create(self, instance):
         if not AuthorizationController.call(

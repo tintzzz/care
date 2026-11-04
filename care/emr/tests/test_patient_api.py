@@ -817,3 +817,70 @@ class TestPatientViewSet(CareAPITestBase):
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["facility_tags"], [])
+
+
+class TestPatientMerge(CareAPITestBase):
+    """SSMM issue 46: merge an existing duplicate patient file into the survivor."""
+
+    def setUp(self):
+        self.superuser = self.create_super_user()
+        self.primary = self.create_patient()
+        self.duplicate = self.create_patient()
+        self.facility = self.create_facility(user=self.superuser)
+        self.facility_organization = self.create_facility_organization(
+            facility=self.facility
+        )
+
+    def merge_url(self, patient):
+        return reverse("patient-merge", kwargs={"external_id": patient.external_id})
+
+    def test_merge_reassigns_records_and_deactivates_duplicate(self):
+        from care.emr.models.encounter import Encounter
+        from care.emr.models.patient import Patient
+
+        encounter = self.create_encounter(
+            patient=self.duplicate,
+            facility=self.facility,
+            organization=self.facility_organization,
+        )
+        self.client.force_authenticate(user=self.superuser)
+        response = self.client.post(
+            self.merge_url(self.primary),
+            {"duplicate": str(self.duplicate.external_id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK, response.data)
+        # the encounter now belongs to the survivor
+        encounter.refresh_from_db()
+        self.assertEqual(encounter.patient_id, self.primary.id)
+        # the duplicate file is soft-deleted and no longer visible
+        self.assertFalse(
+            Patient.objects.filter(external_id=self.duplicate.external_id).exists()
+        )
+        self.assertTrue(
+            Patient._base_manager.filter(
+                external_id=self.duplicate.external_id, deleted=True
+            ).exists()
+        )
+
+    def test_cannot_merge_patient_into_itself(self):
+        self.client.force_authenticate(user=self.superuser)
+        response = self.client.post(
+            self.merge_url(self.primary),
+            {"duplicate": str(self.primary.external_id)},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_merge_requires_permission(self):
+        user = self.create_user()
+        self.client.force_authenticate(user=user)
+        response = self.client.post(
+            self.merge_url(self.primary),
+            {"duplicate": str(self.duplicate.external_id)},
+            format="json",
+        )
+        self.assertIn(
+            response.status_code,
+            (status.HTTP_403_FORBIDDEN, status.HTTP_404_NOT_FOUND),
+        )

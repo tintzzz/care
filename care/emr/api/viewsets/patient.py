@@ -71,6 +71,28 @@ class PatientViewSet(EMRModelViewSet):
             raise PermissionDenied("Cannot delete patient")
 
     def validate_data(self, instance, model_obj=None):
+        # SSMM fix (issue 46): stop duplicate patient files at registration
+        if (
+            model_obj is None
+            and getattr(instance, "phone_number", None)
+            and self.request.query_params.get("allow_duplicate") != "true"
+        ):
+            if instance.age is not None:
+                yob = timezone.now().year - instance.age
+            else:
+                yob = instance.date_of_birth.year if instance.date_of_birth else None
+            duplicate = Patient.objects.filter(
+                name__iexact=instance.name.strip(),
+                phone_number=instance.phone_number,
+                year_of_birth=yob,
+            ).first()
+            if duplicate:
+                raise ValidationError(
+                    f"A patient with the same name, phone number and age already exists "
+                    f"(id {duplicate.external_id}). Use the existing file, or retry with "
+                    f"allow_duplicate=true if this is a different person."
+                )
+
         dob = instance.date_of_birth or (model_obj and model_obj.date_of_birth)
         deceased = instance.deceased_datetime or (
             model_obj and model_obj.deceased_datetime
@@ -501,6 +523,80 @@ class PatientViewSet(EMRModelViewSet):
             request.user,
         )
         return self.retrieve(request, *args, **kwargs)
+
+    class PatientMergeSpec(BaseModel):
+        duplicate: UUID4
+
+    @extend_schema(request=PatientMergeSpec, responses={200: PatientRetrieveSpec})
+    @action(detail=True, methods=["POST"])
+    def merge(self, request, *args, **kwargs):
+        """SSMM issue 46: merge an existing duplicate patient file into this one.
+
+        The patient in the URL is the survivor; `duplicate` (external_id) is merged into it.
+        Every record that points at the duplicate (encounters, accounts, invoices, charge
+        items, service requests, diagnostic reports, questionnaire responses, bookings, …) is
+        re-pointed to the survivor, then the duplicate file is deactivated. Which files are true
+        duplicates is the hospital's call; this only performs a merge an authorised user asks for.
+        """
+        primary = self.get_object()
+        request_data = self.PatientMergeSpec(**request.data)
+        duplicate = get_object_or_404(Patient, external_id=request_data.duplicate)
+        if duplicate.id == primary.id:
+            raise ValidationError("Cannot merge a patient into itself")
+        if not (
+            self.request.user.is_superuser
+            or (
+                AuthorizationController.call(
+                    "can_write_patient_obj", self.request.user, primary
+                )
+                and AuthorizationController.call(
+                    "can_write_patient_obj", self.request.user, duplicate
+                )
+            )
+        ):
+            raise PermissionDenied("You do not have permission to merge these patients")
+
+        skipped = self._ssmm_merge_patient(primary, duplicate, self.request.user)
+        data = PatientRetrieveSpec.serialize(primary).to_json()
+        data["merge_summary"] = {
+            "merged_patient": str(duplicate.external_id),
+            "skipped_relations": skipped,
+        }
+        return Response(data)
+
+    def _ssmm_merge_patient(self, primary, duplicate, user):
+        """Re-point every relation from `duplicate` to `primary`, then soft-delete the
+        duplicate. Each relation moves inside its own savepoint so a unique-constraint clash on
+        one relation is skipped (and reported) instead of aborting the whole merge."""
+        skipped = []
+        with transaction.atomic():
+            for rel in Patient._meta.related_objects:
+                related_model = rel.related_model
+                field_name = rel.field.name
+                # Identifiers are unique per patient; keep the survivor's and drop the
+                # duplicate's rather than risk a clash.
+                if related_model is PatientIdentifier:
+                    continue
+                try:
+                    with transaction.atomic():
+                        if rel.many_to_many:
+                            accessor = rel.get_accessor_name()
+                            getattr(primary, accessor).add(
+                                *getattr(duplicate, accessor).all()
+                            )
+                        else:
+                            related_model._base_manager.filter(
+                                **{field_name: duplicate}
+                            ).update(**{field_name: primary})
+                except Exception as exc:  # noqa: BLE001
+                    skipped.append(f"{related_model.__name__}.{field_name}: {exc}")
+            PatientIdentifier.objects.filter(patient=duplicate).delete()
+            primary.build_instance_identifiers()
+            primary.updated_by = user
+            primary.save()
+            duplicate.updated_by = user
+            duplicate.delete()  # soft delete (sets deleted=True)
+        return skipped
 
     def get_serializer_retrieve_context(self):
         return self.get_serializer_list_context()
